@@ -6,6 +6,8 @@ from tqdm import tqdm
 import distributed
 from itertools import product
 from functools import partial
+import dask
+
 
 
 tqdm = partial(tqdm, position=0, leave=True)
@@ -42,7 +44,7 @@ class Daskified():
         self.old_futures = []
         self.current_futures = None
 
-    def start_cluster(self, testing=False):
+    def start_cluster(self, testing=False, local=False):
         """Starts a cluster
 
         Args:
@@ -52,12 +54,15 @@ class Daskified():
         if testing:
             self.memory = '2GB'
             self.size = 2
-
-        cluster = SLURMCluster(queue=self.queue,
-                               cores=self.cores,
-                               processes=self.processes,
-                               memory=self.memory,
-                               job_extra=self.job_extra)
+        if local:
+            self.size = 2
+            cluster = distributed.LocalCluster(n_workers=self.size)
+        else:
+            cluster = SLURMCluster(queue=self.queue,
+                                cores=self.cores,
+                                processes=self.processes,
+                                memory=self.memory,
+                                job_extra=self.job_extra)
         cluster.scale(self.size)
         client = Client(cluster)
         self.client = client
@@ -117,7 +122,7 @@ class Daskified():
         status = np.array([i.status for i in self.current_futures])
         if not all(status == 'finished'):
             print('Note - not all processes are finished')
-        data = [i.result() for i in tqdm(self.current_futures)]
+        data = self.client.gather(self.current_futures)
         return data
 
     def gridsearch(self, func, *iterables):
@@ -137,7 +142,9 @@ class Daskified():
         futures = []
         iterable_combos = list(product(*iterables))
         for i in iterable_combos:
-            futures.append(self.client.submit(func, *i))
+            futures.append(dask.delayed(func)(*i))
+                           
+        futures = self.client.compute(futures)
         self._update_current_futures(futures)
         return iterable_combos, futures
 
@@ -154,3 +161,8 @@ class Daskified():
             old_futures = self.current_futures
             self.old_futures.append(old_futures)
             self.current_futures = new_futures
+    
+    def shutdown_cluster(self):
+        """Shutdown the client
+        """
+        self.client.shutdown()
