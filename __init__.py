@@ -1,1 +1,3 @@
-from .main import *
+from .main import Daskified
+
+__all__ = ["Daskified"]
