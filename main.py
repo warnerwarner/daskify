@@ -4,16 +4,21 @@ Daskify, high level interface for interacting with distributed computing
 Maintains history of dask futures and distributed datasets
 """
 
+from __future__ import annotations
+
 import time
 from functools import partial
 from itertools import product
-from typing import Any, Callable, Literal
+from typing import TYPE_CHECKING, Any, Callable, Literal
 
 import dask
 import distributed
 import numpy as np
 from dask_jobqueue import SLURMCluster
 from tqdm import tqdm
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 tqdm = partial(tqdm, position=0, leave=True)
 
@@ -27,28 +32,33 @@ class Daskified:
 
     def __init__(
         self,
-        job_extra: list = ["--time=10:00:0 --output=/dev/null --error=/dev/null"],
+        job_extra: list | None = None,
         memory: str = "50GB",
         size: int = 125,
         cores: int = 1,
         processes: int = 1,
         queue: str = "cpu",
     ) -> None:
-        """Initialise class.
+        """Initialise.
 
         Parameters
         ----------
-        job_extra : list
-            extra parameters for the job
+        job_extra : list, optional
+            Extra arguments for the client job.
         memory : str
-            amount of memory per worker
+            How much memory per worker, only used for SLURMCluster
         size : int
-            number of workers to request
+            number of jobs to run
         cores : int
-            number of cores to run the cluster over
+            number of cores per job
         processes : int
+            how many processess to run on each node
+        queue : str
+            which queue to run distributed jobs on
 
         """
+        if job_extra is None:
+            job_extra = ["--time=10:00:0 --output=/dev/null --error=/dev/null"]
         self.job_extra = job_extra
         self.memory = memory
         self.size = size
@@ -106,92 +116,125 @@ class Daskified:
         scattered_data = self.client.scatter(data)
         self.scattered[key] = scattered_data
 
-    def gather_data(self, future_or_key: distributed.client.Future | str) -> Any:
-        """Gather scattered data from the client
+    def gather_data(self, future_or_key: distributed.client.Future | str = None) -> Any:
+        """Gather data from distributed back to main thread.
 
-        Args:
-            future_or_key (distributed.clinet.Future | str): Future object to gather, or a str
-                                               to gather
+        Parameters
+        ----------
+        future_or_key : distributed.client.Future | str
+            Future object or key to query the future dictionary. Used
+            to indicated what data to return.
 
-        Returns:
-            Any: The gathered data
+        Returns
+        -------
+        Any
+            Returns a copy of the scattered data
 
         """
         if isinstance(future_or_key, distributed.client.Future):
-            gathered = self.client.gather(future_or_key)
-        else:
+            self.client.gather(future_or_key)
+        elif isinstance(future_or_key, str):
             gathered = self.client.gather(self.scattered[future_or_key])
+        else:
+            gathered = self.client.gather(self.current_futures)
         return gathered
 
     def check_progress(self) -> None:
-        """Check the progress of the most recently generated futures"""
+        """Check progress of the most recently submitted future tasks."""
         status = np.array([i.status for i in self.current_futures])
         for i in np.unique(status):
-            print(i, len(status[status == i]))
+            print(i, len(np.where(status) == i)[0])
 
-    def monitor_progress(self, futures: distributed.client.Future = None) -> None:
-        """Continuously monitor recently generated futures
+    def monitor_progress(
+        self,
+        futures: list[distributed.client.Future] | None = None,
+    ) -> None:
+        """Continuously monitors most recently submitted future jobs.
 
-        Args:
-            futures (None, optional): Optional futures to monitor. If None
-                                      it selects the most recently generated.
+        Parameters
+        ----------
+        futures : distributed.client.Future
+            Futures to monitor.
 
         """
         if futures is None:
             futures = self.current_futures
-        status = np.array([i.status for i in futures])
-        while not all(status == "finished"):
-            for i in np.unique(status):
-                print(i, len(status[status == i]))
-            time.sleep(0.05)
+
+        with tqdm(total=len(futures)) as pbar:
+            completed = set()
+            while len(completed) < len(futures):
+                status = np.array([i.status for i in futures])
+                finished = {
+                    i for i, s in enumerate(status) if s in ("finished", "error")
+                }
+                new = finished - completed
+                pbar.update(len(new))
+                completed |= new
+
+                time.sleep(0.05)
+        print(f'finished:{len(np.where(status == 'finished')[0])}, error:f{len(np.where(status == 'error')[0])}')
 
     def collect_results(self) -> Any:
-        """Collect the results
+        """Collect results from most recently submitted futures.
 
-        Returns:
-            Any: Results from the most recent futures
+        Returns
+        -------
+        Any
+            The returned output from the futures task
 
         """
         status = np.array([i.status for i in self.current_futures])
         if not all(status == "finished"):
-            print("Note - not all processes are finished")
-        data = self.client.gather(self.current_futures)
-        return data
+            pass
+        return self.client.gather(self.current_futures)
 
-    def gridsearch(
-        self, func: Callable, *iterables,
+    def run(
+        self,
+        func: Callable,
+        args: list[Any] = None,
+        iterables: list[Iterable] = None,
+        loops: int = 1,
     ) -> tuple[list[Any], list[distributed.client.Future]]:
-        """Iterates through the passed iterables and generates separate jobs
-           for each one
+        """Run jobs with every combination of all iterables passed.
 
-        Args:
-            func (function): The function to be ran
-            *iterables: Lists of iterables to be passed. For parameters with
-                        single values, simply generate a list with them inside.
-                        e.g. [value]
+        Iterates through all optional iterables passed to the
+        function. Will run a job with every combination. Total number
+        of jobs will be the product of the length of iterables
 
-        Returns:
-            iterable_combos: Tuples of the iterable parameters
-            futures: The dask futures
+        Parameters
+        ----------
+        func : Callable
+            Function to run with dask futures
+        *iterables : Iterable
+            Iterables containing parameters to pass to func.
+
+        Returns
+        -------
+        tuple[list[Any], list[distributed.client.Future]]
+            Returns both the combination of all iterables along with
+            their associated dask futures
 
         """
         futures = []
         iterable_combos = list(product(*iterables))
-        for i in iterable_combos:
-            futures.append(dask.delayed(func)(*i))
+        for _ in range(loops):
+            for i in iterable_combos:
+                futures.append(dask.delayed(func)(*args, *i))
 
         futures = self.client.compute(futures)
         self._update_current_futures(futures)
         return iterable_combos, futures
 
     def _update_current_futures(
-        self, new_futures: list[distributed.client.Future],
+        self,
+        new_futures: list[distributed.client.Future],
     ) -> None:
-        """Updates the internal parameter which contains the most recent futures
-           Moves old futures into a list, incase they are required later.
+        """Hidden function to update the most recent set of futures.
 
-        Args:
-            new_futures (list): List of the new features
+        Parameters
+        ----------
+        new_futures : list[distributed.client.Future]
+            List of new futures
 
         """
         if self.current_futures is None:
@@ -202,5 +245,5 @@ class Daskified:
             self.current_futures = new_futures
 
     def shutdown_cluster(self) -> None:
-        """Shutdown the client"""
+        """Shutdown currently running cluster."""
         self.client.shutdown()
