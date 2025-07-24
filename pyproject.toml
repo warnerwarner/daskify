@@ -1,0 +1,25 @@
+[project]
+name = "daskify"
+version = "0.0.2"
+dependencies = [
+  "distributed",
+  "dask_jobqueue",
+  "numpy",
+  "tqdm",
+  "itertools",
+  "functools",
+  "dask"
+]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+
+[tool.setuptools.packages]
+find = {}
+
+[tool.ruff]
+select = ["ALL"]
+
+
